@@ -310,9 +310,9 @@ namespace AttendanceSyncService
             {
                 await writer.StartRowAsync();
                 await writer.WriteAsync(log.EmployeeID, NpgsqlDbType.Varchar);
-                // Npgsql handles the conversion from DateTimeOffset to 'timestamp with time zone' correctly.
-                await writer.WriteAsync(log.EventTime, NpgsqlDbType.TimestampTz);
-                await writer.WriteAsync(log.DownloadDate, NpgsqlDbType.TimestampTz);
+                // **FIX**: Convert to UTC before writing for the binary importer.
+                await writer.WriteAsync(log.EventTime.ToUniversalTime(), NpgsqlDbType.TimestampTz);
+                await writer.WriteAsync(log.DownloadDate.ToUniversalTime(), NpgsqlDbType.TimestampTz);
             }
 
             await writer.CompleteAsync();
