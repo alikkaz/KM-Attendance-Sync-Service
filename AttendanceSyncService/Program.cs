@@ -20,52 +20,46 @@ namespace AttendanceSyncService
     {
         public static void Main(string[] args)
         {
-            // Configure Serilog for bootstrapping. This captures any errors that happen during host startup.
+            // Configure Serilog for bootstrapping to capture startup errors.
             Log.Logger = new LoggerConfiguration()
+                .Enrich.FromLogContext()
                 .WriteTo.Console()
                 .CreateBootstrapLogger();
 
-            Log.Information("Starting up the service host...");
+            Log.Information("Starting up service host...");
 
             try
             {
                 CreateHostBuilder(args).Build().Run();
+                Log.Information("Service host shut down cleanly.");
             }
             catch (Exception ex)
             {
-                Log.Fatal(ex, "An unhandled exception occurred during host startup");
+                Log.Fatal(ex, "An unhandled exception occurred during host startup.");
             }
             finally
             {
-                // Ensure all log messages are flushed to their destinations before the application closes.
                 Log.CloseAndFlush();
             }
         }
 
         public static IHostBuilder CreateHostBuilder(string[] args) =>
             Host.CreateDefaultBuilder(args)
-                // Configures the application to be run as a Windows Service.
-                .UseWindowsService()
-                // Integrates Serilog for advanced logging, reading configuration from appsettings.json.
+                .UseWindowsService() // Configure the app to run as a Windows Service.
                 .UseSerilog((context, services, configuration) => configuration
                     .ReadFrom.Configuration(context.Configuration)
-                    .ReadFrom.Services(services)
-                    .Enrich.FromLogContext()
-                    .WriteTo.Console()
-                )
-                // Configures the application's services for dependency injection.
+                    .ReadFrom.Services(services))
                 .ConfigureServices((context, services) =>
                 {
-                    // Register the main data syncer logic as a Singleton. It's safe because it's stateless.
+                    // Register the main data syncer logic as a Singleton.
                     services.AddSingleton<AttendanceDataSyncer>();
-                    // Register the SyncWorker as a Hosted Service, which will be started and stopped by the host.
+                    // Register the SyncWorker as the background service.
                     services.AddHostedService<SyncWorker>();
                 });
     }
 
     /// <summary>
     /// A background service that periodically triggers the data synchronization process.
-    /// This class is responsible for the "when" - scheduling the work.
     /// </summary>
     public class SyncWorker : BackgroundService
     {
@@ -77,62 +71,77 @@ namespace AttendanceSyncService
         {
             _logger = logger;
             _dataSyncer = dataSyncer;
-            // Read the sync interval from appsettings.json, defaulting to 1 minute if not specified.
-            var intervalMinutes = configuration.GetValue<int>("AttendanceSync:SyncIntervalMinutes", 1);
-            _syncInterval = TimeSpan.FromMinutes(intervalMinutes);
+            var intervalMinutes = configuration.GetValue<int>("AppSettings:SyncIntervalMinutes", 1);
+            _syncInterval = TimeSpan.FromMinutes(intervalMinutes > 0 ? intervalMinutes : 1);
         }
 
-        /// <summary>
-        /// The main execution loop for the background service.
-        /// This pattern is more robust than a Timer because it guarantees one sync cycle completes before the next one begins.
-        /// </summary>
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             _logger.LogInformation("Attendance Sync Service starting.");
             _logger.LogInformation("Sync interval set to {Minutes} minutes.", _syncInterval.TotalMinutes);
 
-            // Wait a few seconds on startup before the first run to ensure all services are initialized.
+            // Initial delay to allow other services to start up.
             await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
 
-            // Loop indefinitely until the service is requested to stop.
             while (!stoppingToken.IsCancellationRequested)
             {
                 await _dataSyncer.SyncDataAsync();
                 _logger.LogInformation("Next sync scheduled in {SyncInterval}", _syncInterval);
-                await Task.Delay(_syncInterval, stoppingToken);
+
+                try
+                {
+                    await Task.Delay(_syncInterval, stoppingToken);
+                }
+                catch (TaskCanceledException)
+                {
+                    // This exception is expected when the service is stopping.
+                    break;
+                }
             }
         }
 
         public override async Task StopAsync(CancellationToken cancellationToken)
         {
-            _logger.LogInformation("Attendance Sync Service stopping...");
+            _logger.LogInformation("Attendance Sync Service is stopping.");
             await base.StopAsync(cancellationToken);
-            _logger.LogInformation("Attendance Sync Service stopped.");
+            _logger.LogInformation("Attendance Sync Service has stopped.");
         }
     }
 
     /// <summary>
-    /// Contains the core business logic for reading data from the Access database
-    /// and writing it to the PostgreSQL database. This class is responsible for the "what" and "how".
+    /// Contains the core logic for reading data from Access, processing it, and writing to Supabase.
     /// </summary>
     public class AttendanceDataSyncer
     {
         private readonly ILogger<AttendanceDataSyncer> _logger;
         private readonly string _accessPath;
-        private readonly string _neonConnectionString;
+        private readonly string _supabaseConnectionString;
         private readonly string _lastSyncFile;
+        private readonly TimeZoneInfo _sourceTimeZone;
 
         public AttendanceDataSyncer(ILogger<AttendanceDataSyncer> logger, IConfiguration configuration)
         {
             _logger = logger;
-            _accessPath = configuration["AttendanceSync:AccessDatabasePath"]
-                ?? throw new InvalidOperationException("AccessDatabasePath is not configured");
-            _neonConnectionString = configuration["AttendanceSync:NeonConnectionString"]
-                ?? throw new InvalidOperationException("NeonConnectionString is not configured");
-            _lastSyncFile = configuration["AttendanceSync:LastSyncFilePath"]
+            _accessPath = configuration["AppSettings:AccessDatabasePath"]
+                ?? throw new InvalidOperationException("AppSettings:AccessDatabasePath is not configured.");
+            _supabaseConnectionString = configuration.GetConnectionString("SupabaseConnection")
+                ?? throw new InvalidOperationException("ConnectionStrings:SupabaseConnection is not configured.");
+            _lastSyncFile = configuration["AppSettings:LastSyncFilePath"]
                 ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AttendanceSyncService", "lastSync.txt");
 
-            // Ensure the directory for the last sync file exists.
+            // Load the source timezone from config, defaulting to UTC if not found.
+            try
+            {
+                var timeZoneId = configuration["AppSettings:SourceTimeZoneId"] ?? "UTC";
+                _sourceTimeZone = TimeZoneInfo.FindSystemTimeZoneById(timeZoneId);
+                _logger.LogInformation("Source timezone set to: {TimeZoneId}", _sourceTimeZone.Id);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+                _logger.LogError("The configured timezone ID was not found. Defaulting to UTC.");
+                _sourceTimeZone = TimeZoneInfo.Utc;
+            }
+
             var lastSyncDir = Path.GetDirectoryName(_lastSyncFile);
             if (!string.IsNullOrEmpty(lastSyncDir))
             {
@@ -140,185 +149,184 @@ namespace AttendanceSyncService
             }
         }
 
-        /// <summary>
-        /// Executes a single data synchronization cycle.
-        /// </summary>
         public async Task SyncDataAsync()
         {
             try
             {
-                _logger.LogInformation("=== Sync cycle started at {Time} (Local) ===", DateTime.Now);
+                _logger.LogInformation("--- Sync cycle started at {Time} ---", DateTimeOffset.Now);
 
-                // Get the raw start and end times for the sync window.
-                DateTime rawLastSyncDate = GetLastSyncDate();
-                DateTime rawCurrentSyncDate = DateTime.Now;
+                DateTimeOffset lastSyncDate = GetLastSyncDate();
+                DateTimeOffset currentSyncDate = DateTimeOffset.Now;
 
-                // Truncate the times to the minute to align with the precision of the source database.
-                DateTime lastSyncDate = new DateTime(rawLastSyncDate.Year, rawLastSyncDate.Month, rawLastSyncDate.Day, rawLastSyncDate.Hour, rawLastSyncDate.Minute, 0);
-                DateTime currentSyncDate = new DateTime(rawCurrentSyncDate.Year, rawCurrentSyncDate.Month, rawCurrentSyncDate.Day, rawCurrentSyncDate.Hour, rawCurrentSyncDate.Minute, 0);
+                _logger.LogInformation("Syncing records with DownloadDate between {LastSyncDate} and {CurrentSyncDate}", lastSyncDate, currentSyncDate);
 
-                // If no full minute has passed since the last cycle, skip this run to avoid empty queries.
-                if (lastSyncDate >= currentSyncDate)
-                {
-                    _logger.LogInformation("No new full minute has passed; sync will run in the next cycle.");
-                    SaveLastSyncDate(rawCurrentSyncDate);
-                    _logger.LogInformation("=== Sync cycle completed successfully ===");
-                    return;
-                }
-
-                _logger.LogInformation("Syncing records with DownloadDate between {LastSyncDate} and {CurrentSyncDate} (Local)", lastSyncDate, currentSyncDate);
                 var attendanceLogs = await GetAttendanceLogsFromAccessAsync(lastSyncDate, currentSyncDate);
 
                 if (!attendanceLogs.Any())
                 {
-                    _logger.LogInformation("No new records to sync.");
+                    _logger.LogInformation("No new records found in the source database.");
                 }
                 else
                 {
-                    _logger.LogInformation("Retrieved {RecordCount} records from local database", attendanceLogs.Count);
+                    _logger.LogInformation("Retrieved {RecordCount} raw records from Access database.", attendanceLogs.Count);
 
-                    // Log the retrieved data at Debug level for detailed verification.
-                    _logger.LogDebug("--- Data to be synced ---");
-                    foreach (var log in attendanceLogs)
+                    var filteredLogs = FilterDuplicatePunches(attendanceLogs);
+                    _logger.LogInformation("{FilteredCount} records remaining after deduplication.", filteredLogs.Count);
+
+                    if (filteredLogs.Any())
                     {
-                        _logger.LogDebug(
-                            "  - EmployeeID: {EmployeeID}, EventTime: {EventTime}, DownloadDate: {DownloadDate}",
-                            log.EmployeeID,
-                            log.EventTime,
-                            log.DownloadDate);
+                        await InsertIntoSupabaseAsync(filteredLogs);
+                        _logger.LogInformation("Successfully synced {RecordCount} records to Supabase.", filteredLogs.Count);
                     }
-                    _logger.LogDebug("--- End of data ---");
-
-                    await InsertIntoNeonDatabaseAsync(attendanceLogs);
-                    _logger.LogInformation("Successfully synced {RecordCount} records to remote database", attendanceLogs.Count);
                 }
 
-                // Save the exact current time to the file. This becomes the starting point for the next cycle.
-                SaveLastSyncDate(rawCurrentSyncDate);
-                _logger.LogInformation("=== Sync cycle completed successfully ===");
+                SaveLastSyncDate(currentSyncDate);
+                _logger.LogInformation("--- Sync cycle completed successfully. ---");
             }
             catch (Exception ex)
             {
-                // If any error occurs, log it and do NOT update the last sync date, ensuring the same period is retried.
-                _logger.LogError(ex, "An error occurred during the data sync cycle. The last sync date will not be updated.");
+                _logger.LogError(ex, "An error occurred during the sync cycle. Last sync date will not be updated to retry this window.");
             }
         }
 
-        /// <summary>
-        /// Connects to the MS Access database and retrieves attendance logs within the specified date range.
-        /// </summary>
-        private async Task<List<AttendanceLog>> GetAttendanceLogsFromAccessAsync(DateTime lastSyncDate, DateTime currentSyncDate)
+        private async Task<List<AttendanceLog>> GetAttendanceLogsFromAccessAsync(DateTimeOffset lastSyncDate, DateTimeOffset currentSyncDate)
         {
             var logs = new List<AttendanceLog>();
-            string connectionString = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={_accessPath};Persist Security Info=False;";
+            string connectionString = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={_accessPath};";
+
+            // Convert the DateTimeOffset to the local time of the source database for the query.
+            DateTime accessQueryStartDate = TimeZoneInfo.ConvertTime(lastSyncDate, _sourceTimeZone).DateTime;
+            DateTime accessQueryEndDate = TimeZoneInfo.ConvertTime(currentSyncDate, _sourceTimeZone).DateTime;
+
+            string formattedLastSync = accessQueryStartDate.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture);
+            string formattedCurrentSync = accessQueryEndDate.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture);
 
             await using var connection = new OleDbConnection(connectionString);
             await connection.OpenAsync();
 
-            var tablesToQuery = GetTableNamesForDateRange(lastSyncDate, currentSyncDate);
-
-            // Format dates into the specific string format Access SQL requires: #M/d/yyyy HH:mm:ss#.
-            string formattedLastSync = lastSyncDate.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture);
-            string formattedCurrentSync = currentSyncDate.ToString("MM/dd/yyyy HH:mm:ss", CultureInfo.InvariantCulture);
+            var tablesToQuery = GetTableNamesForDateRange(accessQueryStartDate, accessQueryEndDate);
+            _logger.LogInformation("Querying tables: {Tables}", string.Join(", ", tablesToQuery));
 
             foreach (var tableName in tablesToQuery)
             {
                 try
                 {
-                    // The query now directly embeds the formatted date strings, which is the most reliable way for the OLEDB driver.
                     string query = $@"
                         SELECT [UserId] AS eID, [LogDate] AS evtTime, [DownloadDate] AS dlDate
                         FROM [{tableName}]
-                        WHERE [DownloadDate] >= #{formattedLastSync}# AND [DownloadDate] < #{formattedCurrentSync}#";
+                        WHERE [DownloadDate] > #{formattedLastSync}# AND [DownloadDate] <= #{formattedCurrentSync}#";
 
                     await using var command = new OleDbCommand(query, connection);
-
                     await using var reader = await command.ExecuteReaderAsync();
+
                     while (await reader.ReadAsync())
                     {
-                        var employeeId = reader["eID"].ToString();
-                        if (!string.IsNullOrEmpty(employeeId))
+                        var employeeId = reader["eID"]?.ToString();
+                        if (!string.IsNullOrEmpty(employeeId) && reader["evtTime"] != DBNull.Value && reader["dlDate"] != DBNull.Value)
                         {
-                            var eventTime = (DateTime)reader["evtTime"];
-                            var downloadDate = (DateTime)reader["dlDate"];
+                            // DateTime from Access has Kind=Unspecified. Treat it as a wall-clock time in the source timezone.
+                            var eventTimeUnspecified = (DateTime)reader["evtTime"];
+                            var downloadDateUnspecified = (DateTime)reader["dlDate"];
+
+                            // Convert to a timezone-aware DateTimeOffset.
+                            var eventTime = new DateTimeOffset(eventTimeUnspecified, _sourceTimeZone.GetUtcOffset(eventTimeUnspecified));
+                            var downloadDate = new DateTimeOffset(downloadDateUnspecified, _sourceTimeZone.GetUtcOffset(downloadDateUnspecified));
 
                             logs.Add(new AttendanceLog
                             {
                                 EmployeeID = employeeId,
-                                // Specify that the times read from Access are in the machine's local timezone.
-                                EventTime = DateTime.SpecifyKind(eventTime, DateTimeKind.Local),
-                                DownloadDate = DateTime.SpecifyKind(downloadDate, DateTimeKind.Local)
+                                EventTime = eventTime,
+                                DownloadDate = downloadDate
                             });
                         }
                     }
                 }
                 catch (OleDbException ex) when (ex.Message.Contains("cannot find", StringComparison.OrdinalIgnoreCase))
                 {
-                    // This is an expected case (e.g., a table for a future month doesn't exist yet), so we just log it and continue.
                     _logger.LogDebug("Table {TableName} not found, skipping.", tableName);
                 }
             }
-            return logs.OrderBy(l => l.DownloadDate).ToList();
+            return logs;
         }
 
-        /// <summary>
-        /// Generates the list of table names (e.g., "DeviceLogs_10_2025") that fall within the sync date range.
-        /// </summary>
+        private List<AttendanceLog> FilterDuplicatePunches(List<AttendanceLog> logs)
+        {
+            if (logs.Count < 2) return logs;
+
+            var filteredList = new List<AttendanceLog>();
+            // Group by employee and sort their punches by time to process them chronologically.
+            var groupedLogs = logs.GroupBy(l => l.EmployeeID)
+                                  .Select(g => g.OrderBy(l => l.EventTime).ToList());
+
+            foreach (var employeePunches in groupedLogs)
+            {
+                if (!employeePunches.Any()) continue;
+
+                // Add the very first punch for the employee.
+                filteredList.Add(employeePunches[0]);
+                var lastAddedPunchTime = employeePunches[0].EventTime;
+
+                // Iterate through the rest of the punches.
+                for (int i = 1; i < employeePunches.Count; i++)
+                {
+                    var currentPunch = employeePunches[i];
+                    // Only add the punch if it's more than 2 minutes after the last added one.
+                    if ((currentPunch.EventTime - lastAddedPunchTime).TotalMinutes > 2)
+                    {
+                        filteredList.Add(currentPunch);
+                        lastAddedPunchTime = currentPunch.EventTime;
+                    }
+                }
+            }
+
+            // Return the list sorted by the original download date for sequential insertion.
+            return filteredList.OrderBy(l => l.DownloadDate).ToList();
+        }
+
         private List<string> GetTableNamesForDateRange(DateTime startDate, DateTime endDate)
         {
             var tableNames = new HashSet<string>();
-            var currentDate = startDate;
-            while (currentDate <= endDate)
+            var loopDate = new DateTime(startDate.Year, startDate.Month, 1);
+            var finalDate = new DateTime(endDate.Year, endDate.Month, 1);
+
+            while (loopDate <= finalDate)
             {
-                tableNames.Add($"DeviceLogs_{currentDate.Month}_{currentDate.Year}");
-                currentDate = currentDate.AddMonths(1);
+                tableNames.Add($"DeviceLogs_{loopDate.Month}_{loopDate.Year}");
+                loopDate = loopDate.AddMonths(1);
             }
             return tableNames.ToList();
         }
 
-        /// <summary>
-        /// Inserts a list of attendance logs into the PostgreSQL database using the highly efficient COPY command.
-        /// </summary>
-        private async Task InsertIntoNeonDatabaseAsync(List<AttendanceLog> logs)
+        private async Task InsertIntoSupabaseAsync(List<AttendanceLog> logs)
         {
-            await using var connection = new NpgsqlConnection(_neonConnectionString);
+            await using var connection = new NpgsqlConnection(_supabaseConnectionString);
             await connection.OpenAsync();
 
-            try
-            {
-                // The COPY command is atomic. It will either succeed or fail as a whole, so a manual transaction is not needed.
-                await using var writer = await connection.BeginBinaryImportAsync(
-                    "COPY attendance_logs (employee_id, event_time, download_date) FROM STDIN (FORMAT BINARY)");
+            // The COPY command is the most performant way to bulk insert data into PostgreSQL.
+            await using var writer = await connection.BeginBinaryImportAsync(
+                "COPY attendance_logs (employee_id, event_time, download_date) FROM STDIN (FORMAT BINARY)");
 
-                foreach (var log in logs)
-                {
-                    await writer.StartRowAsync();
-                    await writer.WriteAsync(log.EmployeeID, NpgsqlDbType.Varchar);
-                    // Send the local time directly to the "timestamp without time zone" column.
-                    await writer.WriteAsync(log.EventTime, NpgsqlDbType.Timestamp);
-                    await writer.WriteAsync(log.DownloadDate, NpgsqlDbType.Timestamp);
-                }
-
-                await writer.CompleteAsync();
-            }
-            catch (Exception)
+            foreach (var log in logs)
             {
-                // The exception is re-thrown to be caught and logged by SyncDataAsync.
-                throw;
+                await writer.StartRowAsync();
+                await writer.WriteAsync(log.EmployeeID, NpgsqlDbType.Varchar);
+                // Npgsql handles the conversion from DateTimeOffset to 'timestamp with time zone' correctly.
+                await writer.WriteAsync(log.EventTime, NpgsqlDbType.TimestampTz);
+                await writer.WriteAsync(log.DownloadDate, NpgsqlDbType.TimestampTz);
             }
+
+            await writer.CompleteAsync();
         }
 
-        /// <summary>
-        /// Retrieves the timestamp of the last successful synchronization from a file.
-        /// </summary>
-        private DateTime GetLastSyncDate()
+        private DateTimeOffset GetLastSyncDate()
         {
             try
             {
                 if (File.Exists(_lastSyncFile))
                 {
                     string content = File.ReadAllText(_lastSyncFile).Trim();
-                    if (DateTime.TryParse(content, null, DateTimeStyles.RoundtripKind, out DateTime lastSync))
+                    // Use DateTimeOffset.Parse with RoundtripKind style for ISO 8601 format.
+                    if (DateTimeOffset.TryParse(content, null, DateTimeStyles.RoundtripKind, out var lastSync))
                     {
                         return lastSync;
                     }
@@ -326,38 +334,34 @@ namespace AttendanceSyncService
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Error reading last sync date. Defaulting to earliest time.");
+                _logger.LogWarning(ex, "Could not read last sync date from file. Defaulting to earliest time.");
             }
-
-            // Fallback for the first run: return the earliest possible time to sync all historical data.
-            return DateTime.MinValue;
+            // If the file doesn't exist or is invalid, sync all historical data.
+            return DateTimeOffset.MinValue;
         }
 
-        /// <summary>
-        /// Saves the timestamp of the current synchronization to a file for state persistence.
-        /// </summary>
-        private void SaveLastSyncDate(DateTime syncDate)
+        private void SaveLastSyncDate(DateTimeOffset syncDate)
         {
             try
             {
-                // Use the "o" format specifier for a round-trippable, culture-invariant string.
+                // The "o" format specifier (e.g., 2025-10-22T10:03:48.1234567+02:00) is standard and includes timezone info.
                 File.WriteAllText(_lastSyncFile, syncDate.ToString("o", CultureInfo.InvariantCulture));
-                _logger.LogInformation("Last sync date saved as: {SyncDate} (Local)", syncDate);
+                _logger.LogInformation("Last sync date saved as: {SyncDate}", syncDate);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "FATAL: Could not save the last sync date. This may cause duplicate data processing on the next run.");
+                _logger.LogCritical(ex, "FATAL: Could not save the last sync date. This will cause re-processing of data on next run.");
             }
         }
     }
 
     /// <summary>
-    /// Represents a single attendance log record.
+    /// Represents a single attendance log record with timezone awareness.
     /// </summary>
     public class AttendanceLog
     {
         public required string EmployeeID { get; set; }
-        public DateTime EventTime { get; set; }
-        public DateTime DownloadDate { get; set; }
+        public DateTimeOffset EventTime { get; set; }
+        public DateTimeOffset DownloadDate { get; set; }
     }
 }
