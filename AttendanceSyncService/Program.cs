@@ -328,16 +328,19 @@ namespace AttendanceSyncService
                     // Use DateTimeOffset.Parse with RoundtripKind style for ISO 8601 format.
                     if (DateTimeOffset.TryParse(content, null, DateTimeStyles.RoundtripKind, out var lastSync))
                     {
+                        _logger.LogInformation("Found last sync date: {LastSync}", lastSync);
                         return lastSync;
                     }
                 }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Could not read last sync date from file. Defaulting to earliest time.");
+                _logger.LogWarning(ex, "Could not read last sync date from file. Defaulting to the last 7 days.");
             }
-            // If the file doesn't exist or is invalid, sync all historical data.
-            return DateTimeOffset.MinValue;
+
+            // If the file doesn't exist or is invalid, sync the last 7 days.
+            _logger.LogInformation("No last sync file found. Defaulting to sync the last 7 days.");
+            return DateTimeOffset.Now.AddDays(-7);
         }
 
         private void SaveLastSyncDate(DateTimeOffset syncDate)
