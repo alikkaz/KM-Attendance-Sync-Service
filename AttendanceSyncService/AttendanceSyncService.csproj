@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>dotnet-AttendanceSyncService-8fd53b63-6d12-4c02-b77c-dc7c6fb24081</UserSecretsId>
+    <BaseOutputPath>D:\AttendanceSyncService</BaseOutputPath>
   </PropertyGroup>
 
   <ItemGroup>
